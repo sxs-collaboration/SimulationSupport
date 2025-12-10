@@ -22,27 +22,31 @@
 #  15. loo_crossval
 #  16. plot_loo_residuals
 
-# Imports
-import torch
+import argparse
+
 import gpytorch
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import argparse
+
+# Imports
+import torch
+
 
 ### ML functions
 # ExactGP uses an infinite number of basis functions; GP is non-parametric and models functions globally;
 # limited only by training points
-class GPRegressionModel(gpytorch.models.ExactGP): 
+class GPRegressionModel(gpytorch.models.ExactGP):
     """
     Exact GP with a mixture of RBF and Matern kernels, a linear mean function,
     and normalization capabilities for inputs and outputs.
-    
+
     Args:
         train_x (torch.Tensor): Training input data
         train_y (torch.Tensor): Training targets
         likelihood (gpytorch.likelihoods.GaussianLikelihood): Likelihood for the model
     """
+
     def __init__(self, train_x, train_y, likelihood):
         super(GPRegressionModel, self).__init__(train_x, train_y, likelihood)
 
@@ -50,14 +54,16 @@ class GPRegressionModel(gpytorch.models.ExactGP):
         input_dim = train_x.shape[1] if train_x.dim() > 1 else 1
 
         # Define base kernels - use a mixture of the RBF and Matern kernels
-        self.rbf_kernel = gpytorch.kernels.RBFKernel(ard_num_dims = input_dim)
-        self.matern_kernel = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=input_dim)
+        self.rbf_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=input_dim)
+        self.matern_kernel = gpytorch.kernels.MaternKernel(
+            nu=2.5, ard_num_dims=input_dim
+        )
 
         # Wrap each kernel with a scale kernel - introduces learnable scaling factor
         self.scaled_rbf = gpytorch.kernels.ScaleKernel(self.rbf_kernel)
         self.scaled_matern = gpytorch.kernels.ScaleKernel(self.matern_kernel)
 
-        # Combine kernels - the sum of the kernels allows the model to capture more complex 
+        # Combine kernels - the sum of the kernels allows the model to capture more complex
         # behavior than either kernel alone would
         self.covar_module = self.scaled_rbf + self.scaled_matern
 
@@ -66,19 +72,19 @@ class GPRegressionModel(gpytorch.models.ExactGP):
         self.mean_module = gpytorch.means.LinearMean(input_size=input_dim)
 
         # Normalization parameters - store the mean and std of the inputs and outputs
-        self.input_mean  = None
-        self.input_std   = None
+        self.input_mean = None
+        self.input_std = None
         self.output_mean = None
-        self.output_std  = None
+        self.output_std = None
 
     def set_normalization(self, input_mean, input_std, output_mean, output_std):
         """
         Store normalization parameters in the model.
         """
-        self.input_mean  = input_mean
-        self.input_std   = input_std
+        self.input_mean = input_mean
+        self.input_std = input_std
         self.output_mean = output_mean
-        self.output_std  = output_std
+        self.output_std = output_std
 
     def normalize_input(self, X):
         """
@@ -104,10 +110,11 @@ class GPRegressionModel(gpytorch.models.ExactGP):
             gpytorch.distributions.MultivariateNormal: Distribution for the input.
         """
         if normalize_input:
-            x   = self.normalize_input(x)
-        mean_x  = self.mean_module(x)
+            x = self.normalize_input(x)
+        mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
 
 # GPR training function
 def train_gpr_model(raw_X, raw_Y):
@@ -123,13 +130,17 @@ def train_gpr_model(raw_X, raw_Y):
         gpytorch.likelihoods.GaussianLikelihood: Likelihood for the model
     """
     # Compute normalization parameters
-    input_mean  = raw_X.mean(axis=0) # (D, ) needed for multidimensions to avoid computing a single scalar mean for all columns combined
-    input_std   = raw_X.std(axis=0)  # (D, ) needed for multidimensions to avoid computing a single scalar mean for all columns combined
+    input_mean = raw_X.mean(
+        axis=0
+    )  # (D, ) needed for multidimensions to avoid computing a single scalar mean for all columns combined
+    input_std = raw_X.std(
+        axis=0
+    )  # (D, ) needed for multidimensions to avoid computing a single scalar mean for all columns combined
     output_mean = raw_Y.mean()
-    output_std  = raw_Y.std()
+    output_std = raw_Y.std()
 
     # Normalize data column-wise; needed for all dimension > 1
-    normalized_X = (raw_X - input_mean)  / input_std
+    normalized_X = (raw_X - input_mean) / input_std
     normalized_Y = (raw_Y - output_mean) / output_std
 
     # Ensure X is proper dimension
@@ -157,17 +168,17 @@ def train_gpr_model(raw_X, raw_Y):
     # Add learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        mode='min',
-        factor=0.5, # Reduce LR by a factor of 0.5 when triggered
-        patience=5 # Wait 5 epochs before reducing LR if there is no improvement
+        mode="min",
+        factor=0.5,  # Reduce LR by a factor of 0.5 when triggered
+        patience=5,  # Wait 5 epochs before reducing LR if there is no improvement
     )
 
     # Loss function
     mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
 
     # Track the best model to prevent overfitting
-    best_loss  = float('inf') # Initialize best loss as infinity
-    best_state = None # Placeholder for best model state
+    best_loss = float("inf")  # Initialize best loss as infinity
+    best_state = None  # Placeholder for best model state
 
     # Training loop for 200 iterations
     for i in range(200):
@@ -204,6 +215,7 @@ def train_gpr_model(raw_X, raw_Y):
 
     return model, likelihood
 
+
 # GPR prediction function
 def predict_with_gpr_model(raw_X, model, likelihood):
     """
@@ -212,7 +224,7 @@ def predict_with_gpr_model(raw_X, model, likelihood):
     Args:
         raw_X (numpy.ndarray): Raw input data.
         model (GPRegressionModel): Trained model.
-        likelihood (gpytorch.likelihoods.GaussianLikelihood): Likelihood 
+        likelihood (gpytorch.likelihoods.GaussianLikelihood): Likelihood
         for the model.
 
     Returns:
@@ -239,6 +251,7 @@ def predict_with_gpr_model(raw_X, model, likelihood):
     stddev_denormalized = stddev_normalized * model.output_std
 
     return mean_denormalized, stddev_denormalized
+
 
 # GPR pipeline function - runs the entire process - including training, predicting, plotting - and outputs performance metrics
 # This function encompasses previous functions defined above: train_gpr_model and predict_with_gpr_model and runs them together
@@ -267,35 +280,45 @@ def run_gpr_pipeline(X, Y, target_name="target", plot=True, silent=False):
     Y_pred, uncertainties = predict_with_gpr_model(X, model, likelihood)
 
     # If specified, create correlation plot and compute metrics
-    if plot: 
+    if plot:
         plt.figure(figsize=(8, 6))
         plt.scatter(Y, Y_pred, alpha=0.6, s=20)
 
         # Make perfect correlation line (y = x)
         min_val = min(Y.min(), Y_pred.min())
         max_val = max(Y.max(), Y_pred.max())
-        plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Correlation')
+        plt.plot(
+            [min_val, max_val],
+            [min_val, max_val],
+            "r--",
+            lw=2,
+            label="Perfect Correlation",
+        )
 
         # Labels and formatting
-        plt.xlabel(f'ΔTrue {target_name}', fontsize=12)
-        plt.ylabel(f'GPR Predicted Δ{target_name}', fontsize=12)
-        plt.title(f'GPR Predictions vs True Values ({target_name})', fontsize=14)
+        plt.xlabel(f"ΔTrue {target_name}", fontsize=12)
+        plt.ylabel(f"GPR Predicted Δ{target_name}", fontsize=12)
+        plt.title(
+            f"GPR Predictions vs True Values ({target_name})", fontsize=14
+        )
         plt.grid(True, alpha=0.3)
         plt.legend()
 
         # Calculate and display metrics
         corr = np.corrcoef(Y, Y_pred)[0, 1]
-        r2 = corr ** 2
+        r2 = corr**2
         rmse = np.sqrt(np.mean((Y - Y_pred) ** 2))
         mae = np.mean(np.abs(Y - Y_pred))
-        metrics_text = (
-            f"R² = {r2:.4f}\n"
-            f"RMSE = {rmse:.8f}\n"
-            f"MAE = {mae:.8f}"
-        )
-        plt.text(0.95, 0.05, metrics_text, transform=plt.gca().transAxes,
-                fontsize=12, bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
-                verticalalignment='bottom', horizontalalignment='right'
+        metrics_text = f"R² = {r2:.4f}\nRMSE = {rmse:.8f}\nMAE = {mae:.8f}"
+        plt.text(
+            0.95,
+            0.05,
+            metrics_text,
+            transform=plt.gca().transAxes,
+            fontsize=12,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+            verticalalignment="bottom",
+            horizontalalignment="right",
         )
 
         plt.tight_layout()
