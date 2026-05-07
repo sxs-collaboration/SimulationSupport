@@ -42,4 +42,4 @@ line_length = 80
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
-python_files = ["Test_*.py"]
+python_files = ["Test_*.py", "test_*.py"]
