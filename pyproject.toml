@@ -23,6 +23,7 @@ dev = [
     "black",
     "isort",
     "pytest",
+    "pytest-github-actions-annotate-failures",
 ]
 docs = [
     "sphinx>=7.2",
@@ -35,7 +36,7 @@ where = ["src"]
 [tool.black]
 target-version = ["py39"]
 line-length = 80
-preview = "true"
+preview = true
 enable-unstable-feature = ["string_processing"]
 
 [tool.isort]
