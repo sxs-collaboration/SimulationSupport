@@ -23,6 +23,7 @@ dev = [
     "black",
     "isort",
     "pytest",
+    "pytest-github-actions-annotate-failures",
 ]
 docs = [
     "sphinx>=7.2",
