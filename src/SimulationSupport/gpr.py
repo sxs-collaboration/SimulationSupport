@@ -10,8 +10,72 @@ low-eccentricity orbital parameter initial guesses.
 import gpytorch
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
+from sklearn.preprocessing import StandardScaler
 
+# import juliacall-related modules
+from sxs.julia import PostNewtonian
+
+# Normalize data using the standardization formula
+def normalize_data(X, Y):
+    """
+    Standardizes features and targets. Treats X and Y
+    as 1D arrays and reshapes them to 2D arrays. For multidimensional X
+    (with shape (N, D)), it passes X directly without rehsaping and fits
+    per column instead, which is the default behavior of StandardScaler.
+
+    Args:
+        X: input features (N, ) or (N, D)
+        Y: targets (N, ) or (N, D)
+
+    Returns:
+        X_normalized: normalized input features
+        Y_normalized: normalized target values
+        scaler_X: fitted StandardScaler for X
+        scaler_Y: fitted StandardScaler for Y
+    """
+    scaler_X = StandardScaler()
+    scaler_Y = StandardScaler()
+
+    # Reshape X and Y into 2D arrays before fitting
+    # as StandardScaler expects shape (N, 1) for 1D inputs
+    X_normalized = scaler_X.fit_transform(X.reshape(-1, 1))
+    Y_normalized = scaler_Y.fit_transform(Y.reshape(-1, 1))
+
+    return X_normalized, Y_normalized, scaler_X, scaler_Y
+
+
+# Denormalize predictions by converting them back to their original scale.
+# The model makes predictions in standardized space, but we need the real values
+# in order to correctly interpret the results
+def denormalize_predictions(pred_mean, pred_stddev, scaler_Y):
+    """
+    Map the standardized predictions back to the original scale.
+
+    Args:
+        pred_mean: mean of the predictions in standardized space
+        pred_stddev: standard deviation of the predictions in standardized space
+        scaler_Y: fitted StandardScaler for Y
+
+    Returns:
+        mean_unnormalized: mean of the predictions in the original scale
+        stddev_unnormalized: standard deviation of the predictions in the original scale
+    """
+    # Extract the scalar standard deviation used during fitting.
+    # This is needed in order to rescale the uncertainty separately from the mean
+    scale = scaler_Y.scale_[0]
+
+    # inverse_transform expects a 2D input; squeeze converts it back to 1D
+    mean_unnormalized = scaler_Y.inverse_transform(
+        pred_mean.reshape(-1, 1)
+    ).squeeze()
+
+    # Standard deviations scale linearly, so multiply directly
+    # instead of using inverse_transform
+    stddev_unnormalized = scale * pred_stddev
+
+    return mean_unnormalized, stddev_unnormalized
 
 class GPRegressionModel(gpytorch.models.ExactGP):
     """
@@ -275,7 +339,6 @@ def run_gpr_pipeline(X, Y, target_name="target", plot=True, silent=False):
         model
         likelihood
         Y_pred
-        uncertainties
     """
 
     # Train GPR model
@@ -336,3 +399,578 @@ def run_gpr_pipeline(X, Y, target_name="target", plot=True, silent=False):
         print(f"MAE goal: < 1 % of target range, lower is better")
 
     return model, likelihood, Y_pred
+
+
+# Do both training and eigenvalue analysis in one step
+# uses the functions defined above: train_gpr_model, normalize_data, and predict_with_gpr_model
+def train_model_and_eigenvalue_analysis(
+    df, input_col, output_col, output_col_initial=None, use_diff=False, gpr=None
+):
+    """
+    Trains a GPR model, predicts, plots, and shows the kernel eigenvalue decay.
+
+    Args:
+        df: pd.DataFrame
+        input_col: str
+        output_col: str
+        utput_col_initial: str or None (optional)
+            if provided with use_diff=True, output is computed as output_col - output_col_initial
+        use_diff: bool (optional)
+        gpr: module (optional) - module containing GPR functions
+    """
+
+    # Prepare input data
+    X = df[input_col].values
+
+    # If use_diff is set, train on the correction (delta) instead of the raw output value -
+    # this is useful when the GPR should learn how much to adjust an existing PN guess
+    # rather than predicting the absolute value (which we end up not doing anyway)
+    if use_diff and output_col_initial:
+        Y = df[output_col].values - df[output_col_initial].values
+        y_label = f"$\\Delta${output_col}"
+    else:
+        Y = df[output_col].values
+        y_label = output_col
+
+    # Train GPR
+    model, likelihood = gpr.train_gpr_model(X, Y)
+
+    # Normalize values - needed for eigenvalue analysis
+    X_normalized, Y_normalized, scaler_X, scaler_Y = gpr.normalize_data(X, Y)
+    train_X = torch.from_numpy(X_normalized).float()
+
+    # Dense grid over the input range for a smooth predicted curve
+    dense_X = np.linspace(X.min(), X.max(), 1000).reshape(-1, 1)
+    dense_X_normalized = scaler_X.transform(dense_X)
+    mean_pred, stddev_pred = gpr.predict_with_gpr_model(
+        dense_X, model, likelihood
+    )
+
+    # Sort by X for plotting
+    sorted_indices = np.argsort(dense_X.flatten())
+    sorted_dense_X = dense_X.flatten()[sorted_indices]
+    sorted_mean = mean_pred.flatten()[sorted_indices]
+    sorted_stddev = stddev_pred.flatten()[sorted_indices]
+
+    # Plot GPR fit with 2-sigma confidence band
+    plt.figure(figsize=(8, 6))
+    plt.plot(X, Y, "o", label="Original Test Data", color="orange")
+    plt.plot(sorted_dense_X, sorted_mean, "b", label="GPR Prediction")
+    plt.fill_between(
+        sorted_dense_X,
+        sorted_mean - 2 * sorted_stddev,
+        sorted_mean + 2 * sorted_stddev,
+        alpha=0.5,
+        color="blue",
+        label="Confidence Interval",
+    )
+    plt.xlabel(input_col, fontsize=12)
+    plt.ylabel(y_label, fontsize=12)
+    plt.title(f"GPR: {input_col} → {y_label}", fontsize=14)
+    plt.grid(True)
+    plt.legend()
+    plt.show()
+
+    # Kernel eigenvalue analysis
+    # The eigenvalue decay of the kernel matrix K reveals the effective dimensionality
+    # of the GP - fast decay means the model is dominated by a small number of modes
+    # whereas slow decay means it needs more
+    with torch.no_grad():
+        K = model.covar_module(train_X).evaluate()
+        # Add a small jitter to the diagonal to ensure numerical stability
+        # before computing eigenvalues (avoids near-zero eigenvalues)
+        K += 1e-6 * torch.eye(K.size(-1))
+        eigenvalues = torch.sort(
+            torch.linalg.eigvalsh(K), descending=True
+        ).values
+
+    # Plot the eigenvalues
+    plt.figure(figsize=(8, 5))
+    plt.semilogy(eigenvalues.cpu().numpy(), marker="o")
+    plt.title("Eigenvalues of the GP Kernel Matrix")
+    plt.xlabel("Index")
+    plt.ylabel("Eigenvalue (log scale)")
+    plt.grid(True)
+    plt.show()
+
+
+# Leave one out predictions
+# ie, leave out one data point and do GPR on the remaining points, then repeat for all
+# points. This is used to test model performance
+def loo_predictions(
+    filtered_df, inputVar, outputVar, outputVar_initial=None, use_diff=False
+):
+    """
+    Compute GPR Leave-One-Out predictions and uncertainties for any input variable.
+
+    Args:
+        filtered_df (pd.DataFrame): DataFrame with input data
+        inputVar    (str): Name of the input variable
+        outputVar   (str): Name of the output variable (optional)
+            If provided with use_diff=True, gives output as a difference: outputVar - outputVar_initial
+            use_diff (bool): Whether to compute output as a difference (optional)
+    Returns:
+        X: values of the input variable
+        Y: true (possible delta) output values
+        predictions_LOO: predicted output values (unnormalized, one per point)
+        uncertainties_LOO: stddev of prediction (unnormalized, one per point)
+    """
+
+    # Prepare input and output arrays
+    X = filtered_df[inputVar].values
+    if use_diff and outputVar_initial is not None:
+        Y = (
+            filtered_df[outputVar].values
+            - filtered_df[outputVar_initial].values
+        )
+    else:
+        Y = filtered_df[outputVar].values
+
+    predictions_LOO = np.zeros_like(X, dtype=float)
+    uncertainties_LOO = np.zeros_like(X, dtype=float)
+
+    for i in range(len(X)):
+        # Boolean mask: True for all points except the i-th (held out) point
+        train_indices = np.ones(len(X), dtype=bool)
+        train_indices[i] = False
+
+        X_train = X[train_indices]
+        Y_train = Y[train_indices]
+        X_test = X[i : i + 1]  # shape (1,) - slice preserves dimensions
+
+        # Train model on the raw, unnormalized N-1 data
+        model, likelihood = train_gpr_model(X_train, Y_train)
+        model.eval()
+        likelihood.eval()
+
+        # Normalize X_test using the same normalization used in train_gpr_model
+        X_test_norm = (X_test - model.input_mean) / model.input_std
+        X_test_tensor = torch.from_numpy(X_test_norm).float()
+
+        with torch.no_grad():
+            observed_pred = likelihood(model(X_test_tensor))
+
+        pred_mean = observed_pred.mean.numpy()
+        pred_std = observed_pred.variance.sqrt().numpy()
+
+        # Denormalize predictions using model output normalization
+        pred_mean_un = pred_mean * model.output_std + model.output_mean
+        pred_std_un = pred_std * model.output_std
+
+        # .item() extracts the scalar from a length-1 array
+        predictions_LOO[i] = pred_mean_un.item()
+        uncertainties_LOO[i] = pred_std_un.item()
+
+    return X, Y, predictions_LOO, uncertainties_LOO
+
+
+# Import simulations of interest to apply GPR corrections to
+def parse_test_runs(run_strings):
+    """
+    Parse lines like 'RunID=0000 ZwickyDays=10 q=8.0 chiA=... chiB=... D0=...
+    Omega0=... adot0=...' into a DataFrame for GPR correction. Field order does
+    not matter, relies on key lookup and if there are unknown fields, they get
+    ignored.
+
+    Args:
+        run_strings (list of str): Takes in simulation info in string format.
+
+    Returns:
+        pd.DataFrame: DataFrame with parsed parameter columns.
+    """
+    test_runs = []
+
+    for run in run_strings:
+        # Split on whitespace to get key=value tokens, then build a dict -
+        # field order does not matter and uknown keys are ignored
+        parts = dict(token.split("=", 1) for token in run.split())
+        RunID = parts["RunID"]  # identify simulation
+        q = float(parts["q"])  # mass ratio
+        chiA_x, chiA_y, chiA_z = map(
+            float, parts["chiA"].split(",")
+        )  # spin of object A
+        chiB_x, chiB_y, chiB_z = map(
+            float, parts["chiB"].split(",")
+        )  # spin of object B
+        D0 = float(parts["D0"])  # separation
+        Omega0 = float(
+            parts["Omega0"]
+        )  # spec pn guess orbital frequency to be corrected
+        adot0 = float(parts["adot0"])  # spec pn guess adot to be corrected
+
+        # Prepare test dataframe and rename to match columns
+        test_runs.append(
+            {
+                "name": f"test_{RunID}",
+                "initial_separation": D0,
+                "spec_pn_guess_omega": Omega0,
+                "spec_pn_guess_adot": adot0,
+                "initial_mass1": None,
+                "initial_mass2": None,
+                "mass_ratio": q,
+                "S1x": chiA_x,
+                "S1y": chiA_y,
+                "S1z": chiA_z,
+                "S2x": chiB_x,
+                "S2y": chiB_y,
+                "S2z": chiB_z,
+                "eccentricity": None,
+            }
+        )
+    return pd.DataFrame(test_runs)
+
+
+# Apply GPR corrections using the previously trained model
+def apply_gpr_corrections(
+    df_test,
+    model_omega,
+    likelihood_omega,
+    model_adot,
+    likelihood_adot,
+    input_columns=None,
+):
+    """
+    Apply trained GPR delta corrections to the input DataFrame
+    to produce corrected PN values.
+
+    Args:
+        df_test (pd.DataFrame):         test DataFrame with raw initial values
+        model_omega:                    trained GPR model for omega
+        likelihood_omega:               likelihood for omega model
+        model_adot:                     trained GPR model for adot
+        likelihood_adot:                likelihood for adot model.
+        input_columns (list, optional): columns for the GPR input.
+                                        Defaults to the standard 8 features.
+
+    Returns:
+        pd.DataFrame: DataFrame with added columns:
+            delta_pred_omega
+            delta_pred_adot
+            gpr_corrected_omega
+            gpr_corrected_adot
+    """
+    # Prepare test input X - same features as training
+    if input_columns is None:
+        # Standard 8-feature input: separation, mass ratio, and 3D spins for
+        # both objects - must match the columns used during training
+        input_columns = [
+            "initial_separation",
+            "mass_ratio",
+            "S1x",
+            "S1y",
+            "S1z",
+            "S2x",
+            "S2y",
+            "S2z",
+        ]
+
+    # Use a distinct name X_test so as to not overwrite the X used in the training
+    X_test = df_test[input_columns].values
+
+    # Predict the corrections (deltas) for omega and adot
+    delta_omega_pred, _ = predict_with_gpr_model(
+        X_test, model_omega, likelihood_omega
+    )
+    delta_adot_pred, _ = predict_with_gpr_model(
+        X_test, model_adot, likelihood_adot
+    )
+
+    df_test["delta_pred_omega"] = delta_omega_pred
+    df_test["delta_pred_adot"] = delta_adot_pred
+
+    # Add corrections: PN initial guess + GPR-predicted correction
+    df_test["gpr_corrected_omega"] = (
+        df_test["spec_pn_guess_omega"] + delta_omega_pred
+    )
+    df_test["gpr_corrected_adot"] = (
+        df_test["spec_pn_guess_adot"] + delta_adot_pred
+    )
+
+    return df_test
+
+
+# Save the GPR corrected values to a txt file
+def save_gpr_corrected(
+    df,
+    output_file,
+    omega_col="gpr_corrected_omega",
+    adot_col="gpr_corrected_adot",
+    zwicky_days=10,
+):
+    """ "
+    Write and save GPR corrected runs to a text file.
+    Each line contains RunID, ZwickyDays, q, chiA, chiB, D0, Omega0, adot0.
+
+    Args:
+        df (pd.DataFrame): DataFrame containing corrected simsulations
+        output_file (str): Output file path (e.g., "GPR_corrected_sims.txt")
+        omega_col (str): Column name for the corrected omega
+        adot_col (str): Column name for the corrected adot
+        zwicky_days (int): ZwickyDays value to include (default: 10)
+
+    Returns:
+        None
+    """
+    lines = []
+    for _, row in df.iterrows():
+        # Strip the "test_" prefix added by parse_test_runs to recover the
+        # original RunID (e.g. "test_0111" -> "0111")
+        runid = row["name"].replace("test_", "")
+
+        q = row["mass_ratio"]
+        chiA = f"{row['S1x']},{row['S1y']},{row['S1z']}"
+        chiB = f"{row['S2x']},{row['S2y']},{row['S2z']}"
+        D0 = row["initial_separation"]
+        Omega0 = row[omega_col]
+        adot0 = row[adot_col]
+
+        # High precision formatting: D0 to 10 demical places,
+        # Omega0 and adot0 to 18 decimal places to match the precision
+        # expeced by SpEC
+        line = (
+            f"RunID={runid} "
+            f"ZwickyDays={zwicky_days} "
+            f"q={q} "
+            f"chiA={chiA} "
+            f"chiB={chiB} "
+            f"D0={D0:.10f} "
+            f"Omega0={Omega0:.18f} "
+            f"adot0={adot0:.18e}"
+        )
+        lines.append(line)
+
+    with open(output_file, "w") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+    print(f"Exported {len(lines)} simulations to {output_file}")
+
+
+# Leave one out cross validation to run after GPR
+def loo_crossval(
+    X: np.ndarray,
+    Y: np.ndarray,
+    train_gpr_function,
+    predict_with_gpr_function,
+    target_name="Target",
+):
+    """
+    Perform Leave-One-Out Cross-Validation. Train N models (each omits one point),
+    predict the held-out point, and collect predictions and uncertainties.
+
+    Args:
+        X (np.ndarray): Input features (N, D)
+        Y (np.ndarray): Target variable (N, )
+        train_gpr_funcion (callable): Function to train the GPR model,
+            must return (model, likelihood).
+        predict_gpr_function (callable): Function to predict using the GPR model.
+        target_name (str): Label for plots and print output.
+
+    Returns:
+        predictions_loo: ndarray of shape (N, )
+        uncertainties_loo: ndarray of shape (N, )
+        rmse: float
+        mae: float
+        r_squared: float
+    """
+    N = len(Y)
+    predictions_loo = np.zeros_like(Y)
+    uncertainties_loo = np.zeros_like(Y)
+
+    print(f"Processing {N} LOO iterations for {target_name}...")
+    for i in range(N):
+        # Progress update every 10 iterations so long runs are easily trackable
+        if (i + 1) % 10 == 0:
+            print(f"  {i+1}/{N} complete")
+
+        # Create train and test split
+        # Boolean mask: all True except index i (held out point)
+        train_mask = np.ones(N, dtype=bool)
+        train_mask[i] = False
+
+        X_train = X[train_mask]
+        Y_train = Y[train_mask]
+        X_test = X[
+            i : i + 1
+        ]  # slice preserves the 2D shape needed by the model
+
+        # Train and predict
+        model_loo, likelihood_loo = train_gpr_function(X_train, Y_train)
+        pred_mean, pred_std = predict_with_gpr_function(
+            X_test, model_loo, likelihood_loo
+        )
+
+        predictions_loo[i] = pred_mean[0]
+        uncertainties_loo[i] = pred_std[0]
+
+    Y_loo = Y  # Same as the original Y for the multi input case
+
+    # Plot correlation
+    plt.figure(figsize=(8, 6))
+    plt.scatter(Y_loo, predictions_loo, alpha=0.6, s=20)
+
+    # Perfect correlation/prediction line (y = x)
+    min_val = min(Y_loo.min(), predictions_loo.min())
+    max_val = max(Y_loo.max(), predictions_loo.max())
+    plt.plot(
+        [min_val, max_val],
+        [min_val, max_val],
+        "r--",
+        lw=2,
+        label="Perfect Correlation",
+    )
+
+    # Labels and formatting
+    plt.xlabel(f"True Δ{target_name}", fontsize=12)
+    plt.ylabel(f"LOO Predicted Δ{target_name}", fontsize=12)
+    plt.title(f"LOO: GPR Predictions vs True ({target_name})", fontsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+
+    # Calculate and display R^2
+    # Computed from the Pearson correlation coefficient - equivalent to the coefficient
+    # of determination for a linear fit through the origin
+    correlation = np.corrcoef(Y_loo, predictions_loo)[0, 1]
+    r_squared_loo = correlation**2
+    plt.text(
+        0.95,
+        0.95,
+        f"R² = {r_squared_loo:.4f}",
+        transform=plt.gca().transAxes,
+        fontsize=12,
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        horizontalalignment="right",
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+    # Print metrics with goal values
+    rmse_loo = np.sqrt(np.mean((Y_loo - predictions_loo) ** 2))
+    mae_loo = np.mean(np.abs(Y_loo - predictions_loo))
+    y_range = Y_loo.max() - Y_loo.min()  # used to contextualize RMSE/MAE
+
+    print(f"=== LEAVE-ONE-OUT CROSS-VALIDATION RESULTS ({target_name}) ===")
+    print(
+        f"RMSE: {rmse_loo:.6f} (goal: < 1 % of target range, lower is better)"
+    )
+    print(f"MAE: {mae_loo:.6f} (goal: < 1 % of target range, lower is better)")
+    print(
+        f"R²: {r_squared_loo:.4f} (goal: > 0.95 excellent, > 0.90 good, < 0.70"
+        " poor)"
+    )
+
+    # Additional LOO specific info
+    print(f"\n Dataset size: {len(Y_loo)} points")
+    print(
+        f"Each model is trained on {len(Y_loo)-1} points, and tested on 1 point"
+    )
+    print("This provides an unbiased generalization estimate.")
+
+    return predictions_loo, uncertainties_loo, rmse_loo, mae_loo, r_squared_loo
+
+
+# Function to compute and plot the residuals
+def plot_loo_residuals(Y_loo, predictions_loo, target_name="Target", show=True):
+    """
+    Calculate LOO prediction residuals, plot a histogram, and print statistics.
+
+    Args:
+        Y_loon(np.ndarray): true target values from LOO cross validation
+        predictions_loo (np.ndarray): predicted values from LOO cross validation
+        target_name (str): Name of target variable
+
+    Returns:
+        residuals_loo (np.ndarray): residuals
+    """
+
+    # Compute residuals: LOO prediction error
+    # Residual = true - predicted
+    residuals_loo = Y_loo - predictions_loo
+
+    # Make histogram
+    # plt.figure(figsize=(8, 5))
+    plt.hist(residuals_loo, bins=20, color="skyblue", edgecolor="k", alpha=0.8)
+    # Vertical line at zero highlights systematic bias - ideally the histogram is
+    # centered on this line
+    plt.axvline(0, color="r", linestyle="--", label="Zero Error")
+
+    plt.title(f"LOO Residuals Histogram for {target_name}")
+    plt.xlabel(" Residuals", fontsize=16)
+    plt.ylabel("Count", fontsize=16)
+    plt.tick_params(axis="both", which="major", labelsize=14)
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=14)
+    plt.tight_layout()
+    if show:
+        plt.show()
+
+    # Print statistics
+    print(f"Residual statistics for {target_name}:")
+    print(f"Mean residual:          {np.mean(residuals_loo):.4e}")
+    print(f"Std of residuals:       {np.std (residuals_loo):.4e}")
+    print(f"Max residual:           {np.max (residuals_loo):.4e}")
+    print(f"Min residual:           {np.min (residuals_loo):.4e}")
+
+    return residuals_loo
+
+
+# Load, open, and read saved GPR from disk
+def load_gpr_checkpoint(ckpt_path):
+    """
+    Loads a saved Gaussian Process Regression (GPR) model from disk.
+    Restores model weights, likelihood, normalization parameters,
+    and the raw training data (optional).
+
+    Args:
+        ckpt_path (str): Path to the checkpoint file.
+
+    Returns:
+        model (GPRegressionModel): Loaded GPR model.
+        likelihood (GaussianLikelihood): Loaded likelihood.
+        meta (dict): Metadata including input features.
+    """
+    # Load the checkpoint file
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+
+    # Unpack metadata
+    meta = ckpt["metadata"]
+    features = meta["input_features"]
+    D = len(features)  # number of input dimensions
+
+    # Build dummy input and output tensors as placeholders to construct
+    # the model object correctly. These get replaced with the trained values
+    # saved in the checkpoint later in model.load_state_dict and likelihood.load_state_dict
+    dummy_x = torch.zeros(1, D)  # ensures correct dimension input features
+    dummy_y = torch.zeros(1)  # ensures scalar output
+
+    # Initialize likelihood and model
+    likelihood = (
+        gpytorch.likelihoods.GaussianLikelihood()
+    )  # represents assumed noise model of the data
+    model = GPRegressionModel(dummy_x, dummy_y, likelihood) # constructs model object
+
+    # Load trained parameters back into model and likelihood
+    # and overwrite dummy inputs
+    model.load_state_dict(ckpt["model_state_dict"])
+    likelihood.load_state_dict(ckpt["likelihood_state_dict"])
+
+    # Restore the normalization statistics used during training
+    # so that the predictions are correctly scaled back to the original units
+    norm = ckpt["normalization"]
+    model.set_normalization(
+        input_mean=np.array(norm["input_mean"]),  # mean of training features
+        input_std=np.array(
+            norm["input_std"]
+        ),  # standard deviation of training features
+        output_mean=norm["output_mean"],  # mean of training targets (deltas)
+        output_std=norm[
+            "output_std"
+        ],  # standard deviation of training targets (deltas)
+    )
+
+    # Switch to evaluation mode before inference
+    model.eval()
+    likelihood.eval()
+
+    return model, likelihood, meta
