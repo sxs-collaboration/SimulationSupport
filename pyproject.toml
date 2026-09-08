@@ -7,7 +7,7 @@ name = "SimulationSupport"
 version = "0.2.0"
 description = "Support for SpEC and SpECTRE simulations"
 readme = "README.md"
-license = {file = "LICENSE"}
+license = {file = "LICENSE.txt"}
 authors = [{name = "SXS collaboration"}]
 requires-python = ">=3.9"
 dependencies = [
